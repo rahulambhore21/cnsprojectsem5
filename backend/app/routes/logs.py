@@ -1,62 +1,63 @@
-from typing import List, Optional
+import json
+from typing import List
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from app.config import settings
 from app.database import get_database
 from app.parsers.registry import parser_registry
-from app.services.normalization import NormalizationService
-from app.schemas.event import UniversalEvent
+from app.services.ingest import build_event, ingest_log
 
 router = APIRouter(prefix="/logs", tags=["Logs"])
+
+
+def split_log_text(text: str) -> List[str]:
+    """
+    Splits uploaded text into individual raw log records.
+    A whole-file JSON array / object is expanded into one record per element;
+    everything else (plain logs, JSON Lines) is split by line.
+    """
+    stripped = text.strip()
+    if stripped[:1] in ("[", "{"):
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            data = None
+        if isinstance(data, list):
+            return [json.dumps(item, ensure_ascii=False) for item in data if item not in (None, "", {})]
+        if isinstance(data, dict):
+            return [json.dumps(data, ensure_ascii=False)]
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
 
 @router.post("/upload")
 async def upload_log_file(file: UploadFile = File(...)):
     """
-    Accepts raw log files (.log, .txt, .json, .csv), splits lines,
+    Accepts raw log files (.log, .txt, .json, .csv), splits records,
     processes them through the ULPF pipeline, and records normalized events.
     """
     db = get_database()
-    content = await file.read()
+    content = await file.read(settings.MAX_UPLOAD_BYTES + 1)
+    if len(content) > settings.MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File exceeds the {settings.MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
     try:
-        text = content.decode("utf-8")
+        text = content.decode("utf-8-sig")
     except UnicodeDecodeError:
         text = content.decode("latin-1")
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = split_log_text(text)
     if not lines:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
+    skipped = max(0, len(lines) - settings.MAX_UPLOAD_LINES)
     processed_events: List[dict] = []
     failed_lines: List[dict] = []
+    processed_count = 0
 
-    for idx, raw_log in enumerate(lines[:500]): # Cap at 500 lines for prototype safety
-        parser, parsed_data = parser_registry.detect_and_parse(raw_log, db=db)
-        if parser and parsed_data:
-            event = NormalizationService.to_universal_event(
-                raw_log=raw_log,
-                parsed_data=parsed_data,
-                parser_name=parser.name,
-                parser_version=getattr(parser, "version", "1.0.0"),
-                confidence=getattr(parser, "confidence", 0.98),
-                is_ai_assisted=not getattr(parser, "is_builtin", True)
-            )
-            event_dict = event.model_dump()
-            db["events"].insert_one(event_dict)
-            processed_events.append(event_dict)
-
-            # Update source stats
-            vendor = event.source.vendor or "Generic"
-            db["sources"].update_one(
-                {"vendor": vendor},
-                {
-                    "$inc": {"event_count": 1},
-                    "$setOnInsert": {
-                        "source_id": f"src_{vendor.lower().replace(' ', '_')}",
-                        "name": f"{vendor} Ingest",
-                        "format": event.source.format or "file",
-                        "status": "active"
-                    }
-                },
-                upsert=True
-            )
+    for idx, raw_log in enumerate(lines[:settings.MAX_UPLOAD_LINES]):
+        parser, event_dict = ingest_log(db, raw_log)
+        if event_dict:
+            processed_count += 1
+            if len(processed_events) < 10:
+                processed_events.append(event_dict)
         else:
             failed_lines.append({"line_number": idx + 1, "raw": raw_log[:150]})
 
@@ -64,17 +65,21 @@ async def upload_log_file(file: UploadFile = File(...)):
         "success": True,
         "filename": file.filename,
         "total_lines": len(lines),
-        "processed_count": len(processed_events),
+        "processed_count": processed_count,
         "failed_count": len(failed_lines),
-        "processed_events": processed_events[:10], # Return preview of first 10
-        "failed_samples": failed_lines[:5]
+        "skipped_count": skipped,
+        "truncated": skipped > 0,
+        "processed_events": processed_events,  # preview of first 10
+        "failed_samples": failed_lines[:5],
     }
+
 
 @router.post("/analyze")
 def analyze_log_preview(raw_log: str = Form(...)):
     """Previews format detection and normalization without database storage."""
     db = get_database()
-    parser, parsed_data = parser_registry.detect_and_parse(raw_log.strip(), db=db)
+    raw_log = raw_log.strip()
+    parser, parsed_data = parser_registry.detect_and_parse(raw_log, db=db)
     if not parser or not parsed_data:
         return {
             "detected": False,
@@ -82,19 +87,13 @@ def analyze_log_preview(raw_log: str = Form(...)):
             "parser": None
         }
 
-    preview_event = NormalizationService.to_universal_event(
-        raw_log=raw_log.strip(),
-        parsed_data=parsed_data,
-        parser_name=parser.name,
-        confidence=getattr(parser, "confidence", 0.98),
-        is_ai_assisted=not getattr(parser, "is_builtin", True)
-    )
+    preview_event = build_event(parser, raw_log, parsed_data)
 
     return {
         "detected": True,
         "parser": parser.name,
         "vendor": parser.vendor,
         "format": parsed_data.get("format"),
-        "confidence": getattr(parser, "confidence", 0.98),
+        "confidence": preview_event.processing.confidence,
         "normalized_event": preview_event.model_dump()
     }

@@ -7,6 +7,7 @@ logger = logging.getLogger("ulpf.database")
 
 _client: MongoClient | None = None
 _db: Database | None = None
+_indexes_ready = False
 
 def get_client() -> MongoClient:
     global _client
@@ -18,6 +19,9 @@ def get_client() -> MongoClient:
             logger.info("Connected to MongoDB successfully at %s", settings.MONGODB_URI)
         except Exception as e:
             logger.error("Failed to connect to MongoDB: %s", e)
+            if _client is not None:
+                _client.close()
+            _client = None
             raise e
     return _client
 
@@ -26,12 +30,17 @@ def get_database() -> Database:
     if _db is None:
         client = get_client()
         _db = client[settings.DATABASE_NAME]
+    if not _indexes_ready:
+        init_indexes()  # retried on each request until it succeeds
     return _db
 
 def init_indexes():
     """Ensure database collections have optimal indexes."""
+    global _indexes_ready
     try:
-        db = get_database()
+        if _db is None:
+            get_database()
+        db = _db
         
         # Events indexes
         events = db["events"]
@@ -60,12 +69,14 @@ def init_indexes():
         audit_logs = db["audit_logs"]
         audit_logs.create_index([("timestamp", DESCENDING)])
         
+        _indexes_ready = True
         logger.info("MongoDB indexes successfully verified.")
     except Exception as e:
         logger.warning("Could not initialize MongoDB indexes (will retry on next request): %s", e)
 
 def close_client():
-    global _client, _db
+    global _client, _db, _indexes_ready
+    _indexes_ready = False
     if _client is not None:
         _client.close()
         _client = None

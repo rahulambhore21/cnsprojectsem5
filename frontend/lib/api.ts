@@ -12,15 +12,18 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
   const url = `${API_BASE}/api${endpoint}`;
+  const apiKey = process.env.NEXT_PUBLIC_API_KEY;
+  const authHeaders: Record<string, string> = apiKey ? { "X-API-Key": apiKey } : {};
   const headers = {
     "Content-Type": "application/json",
+    ...authHeaders,
     ...(options.headers || {}),
   };
 
   try {
     const res = await fetch(url, {
       ...options,
-      headers: options.body instanceof FormData ? undefined : headers,
+      headers: options.body instanceof FormData ? authHeaders : headers,
       cache: "no-store",
     });
 

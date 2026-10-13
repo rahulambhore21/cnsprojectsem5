@@ -1,4 +1,5 @@
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,11 +42,25 @@ app = FastAPI(
 # CORS setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allow all origins for prototype development ease
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
+
+# Optional API-key auth: enabled when API_KEY is set. /api/health and CORS preflights stay open.
+@app.middleware("http")
+async def api_key_guard(request: Request, call_next):
+    if (
+        settings.API_KEY
+        and request.method != "OPTIONS"
+        and request.url.path.startswith(settings.API_V1_PREFIX)
+        and request.url.path != f"{settings.API_V1_PREFIX}/health"
+    ):
+        supplied = request.headers.get("x-api-key", "")
+        if not secrets.compare_digest(supplied.encode(), settings.API_KEY.encode()):
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key."})
+    return await call_next(request)
 
 # Global exception handler for resilience
 @app.exception_handler(Exception)
@@ -53,7 +68,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled error processing request %s: %s", request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"success": False, "message": "An unexpected server error occurred.", "error": str(exc)}
+        content={"success": False, "message": "An unexpected server error occurred.", "detail": "Internal server error."}
     )
 
 # Include routes under /api

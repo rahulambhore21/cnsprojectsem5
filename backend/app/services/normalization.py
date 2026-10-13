@@ -1,6 +1,6 @@
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from app.schemas.event import (
     UniversalEvent,
@@ -17,45 +17,59 @@ from app.services.integrity import calculate_sha256
 class NormalizationService:
     @staticmethod
     def normalize_timestamp(ts_str: Optional[str]) -> str:
-        """Converts diverse log timestamp formats into a clean ISO-8601 UTC string."""
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        """Converts diverse log timestamp formats into a clean ISO-8601 UTC string (…Z)."""
+        now = datetime.now(timezone.utc)
+        now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         if not ts_str:
             return now_iso
 
-        ts_clean = ts_str.strip()
-        # ISO-8601 check (e.g. 2026-10-06T10:31:22Z or with offset)
-        if re.match(r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', ts_clean):
-            clean_iso = ts_clean.replace(" ", "T")
-            if not clean_iso.endswith("Z") and "+" not in clean_iso and "-" not in clean_iso[-6:]:
-                clean_iso += "Z"
-            return clean_iso
+        ts_clean = str(ts_str).strip()
+        # ISO-8601 (optionally with fractional seconds and Z / +hh:mm / +hhmm offset)
+        iso = re.match(
+            r'^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:[.,]\d+)?\s*(Z|[+-]\d{2}:?\d{2})?$',
+            ts_clean, re.IGNORECASE
+        )
+        if iso:
+            y, mo, d, h, mi, sec = (int(iso.group(i)) for i in range(1, 7))
+            tz_str = iso.group(7)
+            try:
+                tz = timezone.utc
+                if tz_str and tz_str.upper() != "Z":
+                    sign = 1 if tz_str[0] == "+" else -1
+                    digits = tz_str[1:].replace(":", "")
+                    tz = timezone(sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:])))
+                dt = datetime(y, mo, d, h, mi, sec, tzinfo=tz)
+                return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (ValueError, OverflowError):
+                return now_iso
 
-        # Syslog month day time check (e.g. Oct 06 10:31:22 or Oct  6 10:31:22)
+        # Syslog "Mon DD HH:MM:SS" has no year: assume current year, roll back if that lands in the future
         month_match = re.match(r'^([A-Za-z]{3})\s+(\d+)\s+(\d{2}:\d{2}:\d{2})', ts_clean)
         if month_match:
-            month = month_match.group(1)
-            day = int(month_match.group(2))
-            hms = month_match.group(3)
-            current_year = datetime.now(timezone.utc).year
-            try:
-                parsed_dt = datetime.strptime(f"{current_year} {month} {day:02d} {hms}", "%Y %b %d %H:%M:%S")
-                return parsed_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            except Exception:
-                return now_iso
+            month, day, hms = month_match.group(1), int(month_match.group(2)), month_match.group(3)
+            for year in (now.year, now.year - 1):
+                try:
+                    dt = datetime.strptime(f"{year} {month} {day:02d} {hms}", "%Y %b %d %H:%M:%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                if dt <= now + timedelta(days=1):
+                    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            return now_iso
 
         return now_iso
 
     @staticmethod
     def normalize_action(action_str: Optional[str]) -> str:
-        """Standardizes action verbs to ALLOW, DENY, CLOSE, ALERT."""
+        """Standardizes action verbs to ALLOW, DENY, CLOSE, ALERT using whole-word token matching."""
         if not action_str:
             return "ALLOW"
-        act = action_str.upper().strip()
-        if any(term in act for term in ["DENY", "BLOCK", "DROP", "REJECT", "STOP", "FORBID"]):
+        act = str(action_str).upper().strip()
+        tokens = set(re.split(r'[^A-Z0-9]+', act)) - {""}
+        if tokens & {"DENY", "DENIED", "BLOCK", "BLOCKED", "DROP", "DROPPED", "REJECT", "REJECTED", "STOP", "FORBID", "FORBIDDEN"}:
             return "DENY"
-        if any(term in act for term in ["ALLOW", "PERMIT", "ACCEPT", "PASS", "SUCCESS", "OK", "OPEN", "BUILT"]):
+        if tokens & {"ALLOW", "ALLOWED", "PERMIT", "PERMITTED", "ACCEPT", "ACCEPTED", "PASS", "PASSED", "SUCCESS", "OK", "OPEN", "BUILT"}:
             return "ALLOW"
-        if any(term in act for term in ["CLOSE", "TEARDOWN", "FIN", "RST", "TERMINATED"]):
+        if tokens & {"CLOSE", "CLOSED", "TEARDOWN", "FIN", "RST", "TERMINATED", "TIMEOUT"}:
             return "CLOSE"
         return act
 
@@ -84,13 +98,19 @@ class NormalizationService:
         parsed_data: Dict[str, Any],
         parser_name: str,
         parser_version: str = "1.0.0",
-        confidence: float = 1.0,
+        confidence: Optional[float] = None,
         is_ai_assisted: bool = False
     ) -> UniversalEvent:
         """
         Transforms intermediate parsed key-values into a validated UniversalEvent.
         Preserves raw message lossless and creates cryptographic hash.
         """
+        if confidence is None:
+            try:
+                confidence = float(parsed_data.get("confidence", 1.0))
+            except (TypeError, ValueError):
+                confidence = 1.0
+        confidence = max(0.0, min(1.0, confidence))
         event_id = f"evt_{uuid.uuid4().hex[:12]}"
         timestamp = cls.normalize_timestamp(parsed_data.get("timestamp_str"))
         action = cls.normalize_action(parsed_data.get("action"))

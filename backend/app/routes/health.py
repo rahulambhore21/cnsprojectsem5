@@ -1,8 +1,10 @@
+import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter
 from app.config import settings
 from app.database import get_database
 
+logger = logging.getLogger("ulpf.health")
 router = APIRouter(tags=["Health"])
 
 @router.get("/health")
@@ -12,10 +14,11 @@ def get_health():
         db = get_database()
         db.command("ping")
     except Exception as e:
-        db_status = f"disconnected: {str(e)}"
+        logger.warning("Health check DB ping failed: %s", e)
+        db_status = "disconnected"
 
     return {
-        "status": "healthy" if "disconnected" not in db_status else "degraded",
+        "status": "healthy" if db_status == "connected" else "degraded",
         "service": settings.PROJECT_NAME,
         "version": settings.VERSION,
         "database": {

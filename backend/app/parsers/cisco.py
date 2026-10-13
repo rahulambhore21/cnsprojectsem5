@@ -59,7 +59,7 @@ class CiscoParser(BaseParser):
 
         # 3. Detect Action
         log_lower = raw_log.lower()
-        if "deny" in log_lower or "denied" in log_lower:
+        if "deny" in log_lower or "denied" in log_lower or "drop" in log_lower:
             result["action"] = "DENY"
             result["outcome"] = "blocked"
         elif "built" in log_lower or "permitted" in log_lower or "allow" in log_lower:
@@ -68,9 +68,6 @@ class CiscoParser(BaseParser):
         elif "teardown" in log_lower or "closed" in log_lower:
             result["action"] = "CLOSE"
             result["outcome"] = "success"
-        elif "drop" in log_lower:
-            result["action"] = "DROP"
-            result["outcome"] = "blocked"
         else:
             result["action"] = "ALERT"
             result["outcome"] = "unknown"

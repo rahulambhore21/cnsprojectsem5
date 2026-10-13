@@ -25,11 +25,15 @@ class ParserDefinition(BaseModel):
     updatedAt: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 class ParserApprovalRequest(BaseModel):
-    name: str = Field(..., min_length=2, description="Name for the newly created parser")
-    vendor: str = Field(..., min_length=2, description="Detected or custom vendor name")
+    name: str = Field(..., min_length=2, max_length=100, description="Name for the newly created parser")
+    vendor: str = Field(..., min_length=2, max_length=100, description="Detected or custom vendor name")
     format: str = Field(default="custom", description="Log format")
     sample_log: str = Field(..., description="Sample log line used to build parser")
     mapping: Dict[str, str] = Field(..., description="Mapping of source fields to universal schema dot paths")
     extraction_regex: Optional[str] = Field(default=None, description="Regex used for field extraction")
     delimiter: Optional[str] = Field(default=None, description="Key-value delimiter if applicable")
     event_type: Optional[str] = Field(default="firewall", description="Identified event type")
+
+class ParserUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2)
+    is_active: Optional[bool] = None

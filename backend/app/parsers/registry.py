@@ -24,6 +24,20 @@ class ParserRegistry:
             SyslogParser(),
         ]
 
+    @staticmethod
+    def _to_dynamic(doc: dict) -> CustomDynamicParser:
+        return CustomDynamicParser(
+            parser_id=doc.get("parser_id", "custom"),
+            name=doc.get("name", "Custom Parser"),
+            vendor=doc.get("vendor", "Custom"),
+            format_type=doc.get("format", "custom"),
+            mapping=doc.get("mapping", {}),
+            signature_pattern=doc.get("signature_pattern"),
+            extraction_pattern=doc.get("extraction_pattern"),
+            delimiter=doc.get("delimiter"),
+            version=doc.get("version", "1.0.0")
+        )
+
     def get_all_parsers(self, db=None) -> List[BaseParser]:
         """Returns list of built-in and dynamic database parsers."""
         parsers = list(self.builtin_parsers)
@@ -32,19 +46,7 @@ class ParserRegistry:
                 custom_defs = db["parsers"].find({"is_active": True})
                 for doc in custom_defs:
                     if not doc.get("is_builtin", False):
-                        parsers.append(
-                            CustomDynamicParser(
-                                parser_id=doc.get("parser_id", "custom"),
-                                name=doc.get("name", "Custom Parser"),
-                                vendor=doc.get("vendor", "Custom"),
-                                format_type=doc.get("format", "custom"),
-                                mapping=doc.get("mapping", {}),
-                                signature_pattern=doc.get("signature_pattern"),
-                                extraction_pattern=doc.get("extraction_pattern"),
-                                delimiter=doc.get("delimiter"),
-                                version=doc.get("version", "1.0.0")
-                            )
-                        )
+                        parsers.append(self._to_dynamic(doc))
             except Exception as e:
                 logger.warning("Could not fetch custom parsers from DB: %s", e)
         return parsers
@@ -54,35 +56,33 @@ class ParserRegistry:
         if not raw_log or not isinstance(raw_log, str):
             return None
 
-        # 1. First check custom parsers if any (prioritizes user onboarding)
-        if db is not None:
-            try:
-                custom_defs = db["parsers"].find({"is_active": True, "is_builtin": False})
-                for doc in custom_defs:
-                    dyn_parser = CustomDynamicParser(
-                        parser_id=doc.get("parser_id", "custom"),
-                        name=doc.get("name", "Custom Parser"),
-                        vendor=doc.get("vendor", "Custom"),
-                        format_type=doc.get("format", "custom"),
-                        mapping=doc.get("mapping", {}),
-                        signature_pattern=doc.get("signature_pattern"),
-                        extraction_pattern=doc.get("extraction_pattern"),
-                        delimiter=doc.get("delimiter"),
-                        version=doc.get("version", "1.0.0")
-                    )
-                    if dyn_parser.can_parse(raw_log):
-                        return dyn_parser
-            except Exception as e:
-                logger.warning("Error evaluating dynamic parsers: %s", e)
+        # Precedence: vendor-specific/structured built-ins, then user-onboarded parsers,
+        # and only then the catch-all generic syslog parser.
+        generic = [p for p in self.builtin_parsers if isinstance(p, SyslogParser)]
+        specific = [p for p in self.builtin_parsers if not isinstance(p, SyslogParser)]
 
-        # 2. Check built-in parsers in precedence order
-        for parser in self.builtin_parsers:
+        for parser in specific:
             try:
                 if parser.can_parse(raw_log):
                     return parser
             except Exception as e:
                 logger.debug("Parser %s check error: %s", parser.name, e)
-                continue
+
+        if db is not None:
+            try:
+                for doc in db["parsers"].find({"is_active": True, "is_builtin": False}):
+                    dyn_parser = self._to_dynamic(doc)
+                    if dyn_parser.can_parse(raw_log):
+                        return dyn_parser
+            except Exception as e:
+                logger.warning("Error evaluating dynamic parsers: %s", e)
+
+        for parser in generic:
+            try:
+                if parser.can_parse(raw_log):
+                    return parser
+            except Exception as e:
+                logger.debug("Parser %s check error: %s", parser.name, e)
 
         return None
 

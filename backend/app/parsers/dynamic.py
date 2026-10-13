@@ -33,17 +33,19 @@ class CustomDynamicParser(BaseParser):
     def can_parse(self, raw_log: str) -> bool:
         if not raw_log or not isinstance(raw_log, str):
             return False
-        # If signature pattern is provided, test regex or substring
+        # An explicit signature is authoritative.
         if self.signature_pattern:
             try:
-                if re.search(self.signature_pattern, raw_log, re.IGNORECASE):
-                    return True
-            except Exception:
-                if self.signature_pattern.lower() in raw_log.lower():
-                    return True
-        # Check if mapped field keys appear in the log
-        matching_keys = sum(1 for k in self.mapping.keys() if f"{k}=" in raw_log or f"{k}:" in raw_log or f" {k} " in raw_log)
-        return matching_keys >= max(2, len(self.mapping) // 2)
+                return bool(re.search(self.signature_pattern, raw_log, re.IGNORECASE | re.DOTALL))
+            except re.error:
+                return self.signature_pattern.lower() in raw_log.lower()
+        # Otherwise require most mapped field keys to appear as key=… / key:… tokens
+        if not self.mapping:
+            return False
+        matching_keys = sum(
+            1 for k in self.mapping if re.search(rf"\b{re.escape(k)}\s*[=:]", raw_log, re.IGNORECASE)
+        )
+        return matching_keys >= max(2, (len(self.mapping) + 1) // 2)
 
     def parse(self, raw_log: str) -> Dict[str, Any]:
         result: Dict[str, Any] = {
@@ -119,5 +121,13 @@ class CustomDynamicParser(BaseParser):
                     result["vendor"] = val
                 elif target_path == "timestamp":
                     result["timestamp_str"] = val
+                elif target_path == "user.domain":
+                    result["domain"] = val
+                elif target_path == "source.device_ip":
+                    result["device_ip"] = val
+                elif target_path == "event.type":
+                    result["type"] = val.lower()
+                elif target_path == "event.category":
+                    result["category"] = val.lower()
 
         return result

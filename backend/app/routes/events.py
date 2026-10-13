@@ -1,11 +1,14 @@
 import re
-from datetime import datetime, timezone
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Query
 from app.database import get_database
-from app.parsers.registry import parser_registry
-from app.services.normalization import NormalizationService
-from app.schemas.event import UniversalEvent, EventProcessRequest, EventProcessResponse
+from app.config import settings
+from app.services.ingest import ingest_log
+from app.services.integrity import calculate_sha256, verify_integrity
+from app.schemas.event import (
+    UniversalEvent, EventProcessRequest, EventProcessResponse,
+    BatchProcessRequest, BatchProcessResponse
+)
 
 router = APIRouter(prefix="/events", tags=["Events"])
 
@@ -82,52 +85,60 @@ def process_event(req: EventProcessRequest):
     if not raw_log:
         raise HTTPException(status_code=400, detail="Empty log input provided.")
 
-    parser, parsed_data = parser_registry.detect_and_parse(raw_log, db=db)
-    if not parser or not parsed_data:
+    parser, event_dict = ingest_log(db, raw_log, req.source_hint)
+    if not event_dict:
         return EventProcessResponse(
             success=False,
             message="No suitable parser detected for this log format. Use AI Parser Studio to onboard this format.",
             error="UNKNOWN_FORMAT"
         )
 
-    event = NormalizationService.to_universal_event(
-        raw_log=raw_log,
-        parsed_data=parsed_data,
-        parser_name=parser.name,
-        parser_version=getattr(parser, "version", "1.0.0"),
-        confidence=getattr(parser, "confidence", 0.98),
-        is_ai_assisted=not getattr(parser, "is_builtin", True)
-    )
-
-    event_dict = event.model_dump()
-    db["events"].insert_one(event_dict)
-
-    # Update source statistics
-    vendor = event.source.vendor or "Generic"
-    db["sources"].update_one(
-        {"vendor": vendor},
-        {
-            "$set": {
-                "last_seen": datetime.now(timezone.utc).isoformat(),
-                "status": "active"
-            },
-            "$inc": {"event_count": 1},
-            "$setOnInsert": {
-                "source_id": f"src_{vendor.lower().replace(' ', '_')}",
-                "name": f"{vendor} Ingest",
-                "vendor": vendor,
-                "format": event.source.format or "custom",
-                "createdAt": datetime.now(timezone.utc).isoformat()
-            }
-        },
-        upsert=True
-    )
-
     return EventProcessResponse(
         success=True,
-        event=event,
+        event=UniversalEvent(**event_dict),
         message=f"Log successfully parsed using {parser.name} and normalized into Universal Event Schema."
     )
+
+@router.post("/batch", response_model=BatchProcessResponse)
+def process_batch(req: BatchProcessRequest):
+    """Parses and stores up to MAX_BATCH_LOGS raw logs in one request."""
+    if len(req.logs) > settings.MAX_BATCH_LOGS:
+        raise HTTPException(status_code=413, detail=f"Batch exceeds {settings.MAX_BATCH_LOGS} logs.")
+    db = get_database()
+    events, errors = [], []
+    for idx, raw in enumerate(req.logs):
+        raw = (raw or "").strip()
+        if not raw:
+            errors.append({"index": idx, "error": "EMPTY"})
+            continue
+        _, event_dict = ingest_log(db, raw)
+        if event_dict:
+            events.append(UniversalEvent(**event_dict))
+        else:
+            errors.append({"index": idx, "error": "UNKNOWN_FORMAT", "raw": raw[:150]})
+    return BatchProcessResponse(
+        processed_count=len(req.logs),
+        success_count=len(events),
+        failure_count=len(errors),
+        events=events,
+        errors=errors
+    )
+
+@router.get("/{event_id}/verify")
+def verify_event(event_id: str):
+    """Recomputes the SHA-256 of the stored raw message and compares it with the stored fingerprint."""
+    db = get_database()
+    event = db["events"].find_one({"event_id": event_id}, {"_id": 0})
+    if not event:
+        raise HTTPException(status_code=404, detail=f"Event '{event_id}' not found.")
+    expected = (event.get("integrity") or {}).get("sha256", "")
+    message = (event.get("raw") or {}).get("message", "")
+    return {
+        "event_id": event_id,
+        "verified": verify_integrity(message, expected),
+        "expected_sha256": expected,
+        "computed_sha256": calculate_sha256(message),
+    }
 
 @router.delete("/{event_id}")
 def delete_event(event_id: str):

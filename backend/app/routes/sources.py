@@ -1,3 +1,4 @@
+import re
 from fastapi import APIRouter, HTTPException
 from app.database import get_database
 
@@ -18,7 +19,7 @@ def get_source(source_id: str):
     source = db["sources"].find_one({"source_id": source_id}, {"_id": 0})
     if not source:
         # Fallback query by vendor name
-        source = db["sources"].find_one({"vendor": {"$regex": f"^{source_id}$", "$options": "i"}}, {"_id": 0})
+        source = db["sources"].find_one({"vendor": {"$regex": f"^{re.escape(source_id)}$", "$options": "i"}}, {"_id": 0})
     if not source:
         raise HTTPException(status_code=404, detail="Source not found.")
     return source

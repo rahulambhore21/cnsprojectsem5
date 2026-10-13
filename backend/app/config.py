@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     PORT: int = 8000
     CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000"
     
+    # Security / limits
+    API_KEY: str = Field(default="", description="If set, all /api routes except /api/health require header X-API-Key")
+    MAX_UPLOAD_BYTES: int = 5 * 1024 * 1024
+    MAX_UPLOAD_LINES: int = 500
+    MAX_BATCH_LOGS: int = 500
+    MAX_REGEX_LENGTH: int = 500
+
     # OpenAI
     OPENAI_API_KEY: str = Field(default="")
     OPENAI_MODEL: str = "gpt-4o-mini"

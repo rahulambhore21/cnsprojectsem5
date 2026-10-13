@@ -64,6 +64,9 @@ class SyslogParser(BaseParser):
             sev_map = {0: "critical", 1: "critical", 2: "critical", 3: "high", 4: "medium", 5: "medium", 6: "low", 7: "low"}
             result["severity"] = sev_map.get(severity_code, "medium")
 
+        if "severity" not in result:
+            result["severity"] = "low"
+
         if timestamp:
             result["timestamp_str"] = timestamp
         if device_name:

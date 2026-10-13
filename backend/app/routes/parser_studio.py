@@ -6,6 +6,8 @@ from app.database import get_database
 from app.services.ai_service import AIService
 from app.schemas.ai import AIAnalysisRequest, AIAnalysisResponse
 from app.schemas.parser import ParserApprovalRequest
+from app.services.regex_safety import validate_user_regex
+from app.routes.parser_studio_targets import ALLOWED_TARGETS
 
 router = APIRouter(prefix="/parser-studio", tags=["AI Parser Studio"])
 
@@ -20,6 +22,14 @@ def analyze_unknown_log(req: AIAnalysisRequest):
     
     return AIService.analyze_log(req.raw_log.strip(), req.context_hint)
 
+def _build_signature(mapping_keys):
+    """Signature requiring ALL of the first few mapped keys to appear as key=… / key:… tokens."""
+    keys = [k for k in mapping_keys if k][:3]
+    if not keys:
+        return None
+    return "".join(rf"(?=.*\b{re.escape(k)}\s*[=:])" for k in keys)
+
+
 @router.post("/approve")
 def approve_and_save_parser(req: ParserApprovalRequest):
     """
@@ -27,63 +37,70 @@ def approve_and_save_parser(req: ParserApprovalRequest):
     Enables future logs matching this format/signature to be parsed dynamically.
     """
     db = get_database()
-    parser_id = f"parser_{uuid.uuid4().hex[:8]}"
 
-    # Build signature pattern if not provided
-    signature = req.extraction_regex
-    if not signature:
-        # Match significant keys in sample log
-        keys = list(req.mapping.keys())
-        if keys:
-            pattern_parts = [re.escape(k) for k in keys[:3]]
-            signature = "|".join(pattern_parts)
+    mapping = {k.strip(): v.strip() for k, v in req.mapping.items() if k.strip()}
+    if not mapping:
+        raise HTTPException(status_code=422, detail="At least one field mapping is required.")
+    bad = sorted({v for v in mapping.values() if v not in ALLOWED_TARGETS})
+    if bad:
+        raise HTTPException(status_code=422, detail=f"Unsupported target field(s): {', '.join(bad)}")
 
-    parser_doc = {
-        "parser_id": parser_id,
+    try:
+        extraction = validate_user_regex(req.extraction_regex)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # The signature is always derived from the mapping keys (and must never match everything).
+    signature = _build_signature(mapping.keys())
+    now = datetime.now(timezone.utc).isoformat()
+
+    fields = {
         "name": req.name,
         "vendor": req.vendor,
         "format": req.format,
-        "mapping": req.mapping,
+        "mapping": mapping,
         "signature_pattern": signature,
+        "extraction_pattern": extraction,
         "delimiter": req.delimiter or "=",
         "sample_log": req.sample_log,
         "event_type": req.event_type or "firewall",
-        "version": "1.0.0",
         "is_builtin": False,
         "is_active": True,
-        "createdAt": datetime.now(timezone.utc).isoformat(),
-        "updatedAt": datetime.now(timezone.utc).isoformat()
+        "updatedAt": now,
     }
 
-    db["parsers"].insert_one(parser_doc)
+    # Re-approving the same name+vendor updates the parser (and bumps its patch version) instead of duplicating it
+    existing = db["parsers"].find_one({"name": req.name, "vendor": req.vendor, "is_builtin": False})
+    if existing:
+        parser_id = existing["parser_id"]
+        major, minor, patch = (list(map(int, existing.get("version", "1.0.0").split("."))) + [0, 0, 0])[:3]
+        fields["version"] = f"{major}.{minor}.{patch + 1}"
+        db["parsers"].update_one({"parser_id": parser_id}, {"$set": fields})
+    else:
+        parser_id = f"parser_{uuid.uuid4().hex[:8]}"
+        db["parsers"].insert_one({"parser_id": parser_id, "version": "1.0.0", "createdAt": now, **fields})
 
     # Register/update in sources collection
     db["sources"].update_one(
         {"vendor": req.vendor},
         {
-            "$set": {
-                "format": req.format,
-                "status": "active",
-                "last_seen": datetime.now(timezone.utc).isoformat()
-            },
+            "$set": {"format": req.format, "status": "active", "last_seen": now},
             "$setOnInsert": {
-                "source_id": f"src_{uuid.uuid4().hex[:8]}",
+                "source_id": f"src_{req.vendor.lower().replace(' ', '_')}",
                 "name": req.name,
-                "vendor": req.vendor,
                 "event_count": 0,
-                "createdAt": datetime.now(timezone.utc).isoformat()
-            }
+                "createdAt": now,
+            },
         },
         upsert=True
     )
 
-    # Record audit log
     db["audit_logs"].insert_one({
-        "action": "PARSER_ONBOARDED",
+        "action": "PARSER_UPDATED" if existing else "PARSER_ONBOARDED",
         "user": "analyst",
         "resource": parser_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "metadata": {"name": req.name, "vendor": req.vendor, "mapped_fields": len(req.mapping)}
+        "timestamp": now,
+        "metadata": {"name": req.name, "vendor": req.vendor, "mapped_fields": len(mapping)}
     })
 
     return {

@@ -1,40 +1,48 @@
-version: "3.8"
-
 services:
   mongodb:
     image: mongo:7.0
     container_name: ulpf-mongodb
-    restart: always
+    restart: unless-stopped
+    # Bound to localhost only; reachable by other services over the compose network
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: ulpf-backend
-    restart: always
+    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
       - MONGODB_URI=mongodb://mongodb:27017
       - DATABASE_NAME=ulpf
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - API_KEY=${API_KEY:-}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* values are inlined at build time, so they must be build args
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     container_name: ulpf-frontend
-    restart: always
+    restart: unless-stopped
     ports:
       - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
     depends_on:
       - backend
 

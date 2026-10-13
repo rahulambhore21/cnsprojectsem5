@@ -1,4 +1,3 @@
-from collections import defaultdict
 from datetime import datetime, timezone
 from fastapi import APIRouter
 from app.database import get_database
@@ -61,38 +60,30 @@ def get_event_distribution():
     - Timeline (events grouped by hour/time bucket)
     """
     db = get_database()
-    events = list(db["events"].find({}, {"_id": 0, "event.action": 1, "event.severity": 1, "timestamp": 1}))
+    events_col = db["events"]
 
     action_counts = {"ALLOW": 0, "DENY": 0, "CLOSE": 0, "ALERT": 0}
+    for r in events_col.aggregate([{"$group": {"_id": "$event.action", "count": {"$sum": 1}}}]):
+        # Unknown / missing actions are reported as ALERT
+        key = r["_id"] if r["_id"] in action_counts else "ALERT"
+        action_counts[key] += r["count"]
+
     severity_counts = {"low": 0, "medium": 0, "high": 0, "critical": 0}
-    timeline_dict = defaultdict(int)
+    for r in events_col.aggregate([{"$group": {"_id": "$event.severity", "count": {"$sum": 1}}}]):
+        key = r["_id"] if r["_id"] in severity_counts else "low"
+        severity_counts[key] += r["count"]
 
-    for ev in events:
-        # Action
-        act = ev.get("event", {}).get("action", "ALERT")
-        if act in action_counts:
-            action_counts[act] += 1
-        else:
-            action_counts["ALERT"] += 1
-
-        # Severity
-        sev = ev.get("event", {}).get("severity", "low")
-        if sev in severity_counts:
-            severity_counts[sev] += 1
-        else:
-            severity_counts["low"] += 1
-
-        # Timeline bucket (hour level)
-        ts = ev.get("timestamp", "")
-        if len(ts) >= 13:
-            # Extract YYYY-MM-DDTHH or HH:00
-            hour_key = ts[11:16] # e.g. "10:14" or hour block
-            timeline_dict[hour_key] += 1
-
-    # Format timeline for Recharts line/area chart
+    # Timeline: hourly buckets keyed on "YYYY-MM-DDTHH" so different days never merge
+    timeline_rows = events_col.aggregate([
+        {"$match": {"timestamp": {"$type": "string"}}},
+        {"$group": {"_id": {"$substrBytes": ["$timestamp", 0, 13]}, "count": {"$sum": 1}}},
+        {"$sort": {"_id": -1}},
+        {"$limit": 48},
+        {"$sort": {"_id": 1}},
+    ])
     timeline_data = [
-        {"time": k, "count": v}
-        for k, v in sorted(timeline_dict.items())
+        {"time": f"{r['_id'][5:10]} {r['_id'][11:13]}:00", "count": r["count"]}
+        for r in timeline_rows if len(r["_id"]) == 13
     ]
     if not timeline_data:
         timeline_data = [

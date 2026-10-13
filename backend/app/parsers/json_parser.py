@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Any, Dict, List
 from app.parsers.base import BaseParser
 
@@ -84,10 +85,11 @@ class JsonParser(BaseParser):
         for k in ["action", "act", "decision", "status", "result"]:
             if k in data and data[k]:
                 val = str(data[k]).upper()
-                if "DENY" in val or "BLOCK" in val or "DROP" in val or "REJECT" in val:
+                tokens = set(re.split(r"[^A-Z0-9]+", val)) - {""}
+                if tokens & {"DENY", "DENIED", "BLOCK", "BLOCKED", "DROP", "DROPPED", "REJECT", "REJECTED"}:
                     result["action"] = "DENY"
                     result["outcome"] = "blocked"
-                elif "ALLOW" in val or "ACCEPT" in val or "PERMIT" in val or "OK" in val or "200" in val:
+                elif tokens & {"ALLOW", "ALLOWED", "ACCEPT", "ACCEPTED", "PERMIT", "PERMITTED", "OK", "SUCCESS", "200"}:
                     result["action"] = "ALLOW"
                     result["outcome"] = "success"
                 else:
